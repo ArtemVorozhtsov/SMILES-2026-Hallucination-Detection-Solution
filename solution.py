@@ -1,45 +1,7 @@
 """
 Hallucination Detection in Small Language Models
-
-# Files you can edit:
-    - aggregation.py — layer selection and token pooling 
-    - aggregation.py | extract_geometric_features — optional hand-crafted features 
-    - probe.py | HallucinationProbe — probe classifier (nn.Module subclass) 
-    - splitting.py | split_data — train / validation / test split strategy 
-
-# Fixed infrastructure (do not edit)
-    - model.py | LLM loader (get_model_and_tokenizer) 
-    - evaluate.py | Evaluation loop, summary table, JSON output 
-
-# Data Format — ChatML and Special Tokens
-    The `prompt` column uses ChatML (Chat Markup Language), the conversation
-    template built into Qwen models.  Each message is wrapped in role markers:
-
-    <|im_start|>system
-    You are a helpful assistant.<|im_end|>
-    <|im_start|>user
-    ... question and context ... <|im_end|>
-    <|im_start|>assistant
-
-    Special tokens and their roles:
-
-    - `<|im_start|>` — opens a chat turn; the role (`system`, `user`, or `assistant`) immediately follows
-    - `<|im_end|>` — closes the current chat turn
-    - `<|endoftext|>` — end-of-sequence (EOS) token appended by the model at the end of its response
-
-    The `prompt` ends right after `<|im_start|>assistant\n` — it provides the
-    full context up to (but not including) the model's reply.  The `response`
-    column holds the actual generated text, ending with `<|endoftext|>`.
-
-    We feed the concatenation of `prompt + response` to the feature extractor
-    so the hidden states capture both the question context and the model's
-    specific answer — the hallucination signal lives in that joint representation.
-
-
 """
-
 import time
-
 import numpy as np
 import pandas as pd
 import torch
@@ -52,177 +14,123 @@ from probe import HallucinationProbe
 from splitting import split_data
 
 # ---------------------------------------------------------------------
-
-DATA_FILE     = "./data/dataset.csv"   # path to the dataset CSV
-OUTPUT_FILE   = "results.json"         # where to write the results summary
+DATA_FILE     = "./data/dataset.csv"
+OUTPUT_FILE   = "results.json"
 BATCH_SIZE    = 4
-USE_GEOMETRIC = False                  # set True to enable geometric feature extraction
-TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
-PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
+USE_GEOMETRIC = True
+TEST_FILE     = "./data/test.csv"
+PREDICTIONS_FILE = "predictions.csv"
 
 assert OUTPUT_FILE == "results.json"
 assert PREDICTIONS_FILE == "predictions.csv"
 # ---------------------------------------------------------------------
-if __name__=='__main__':
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else 
+                          "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Device       : {device}")
-    print(f"Data         : {DATA_FILE}")
-    print(f"Max length   : {MAX_LENGTH} tokens")
     print(f"Geometric feats: {USE_GEOMETRIC}")
 
-
     df = pd.read_csv(DATA_FILE)
-
-    # Build the text fed to the LLM: concatenation of prompt and response.
     all_texts  = [f"{row['prompt']}{row['response']}" for _, row in df.iterrows()]
     all_labels = np.array([int(float(h)) for h in df["label"]])
+    print(f"Loaded {len(all_labels)} samples  ({all_labels.sum()} hallucinated)")
 
-    n_total = len(all_labels)
-    print(f"Loaded {n_total} samples  "
-        f"({all_labels.sum()} hallucinated / {(all_labels == 0).sum()} truthful)")
-    
-    # Preview the raw data
-    print(f"Columns : {df.columns.tolist()}")
-    print(f"Rows    : {len(df)}")
-    print(f"Labels  : {dict(df['label'].value_counts().sort_index())}")
-    print()
-
-    # Show the first sample (truncated for readability)
-    row0 = df.iloc[0]
-    print("── prompt (first 500 chars) " + "─" * 34)
-    print(row0["prompt"][:500])
-    print()
-    print("── response (first 300 chars) " + "─" * 31)
-    print(row0["response"][:300])
-    print()
-    label_str = "hallucinated" if int(row0["label"]) else "truthful"
-    print(f"── label : {int(row0['label'])}  ({label_str})")
-
-
-    # Load the LLM
     model, tokenizer = get_model_and_tokenizer()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
-    all_features: list = []
+    prompt_lengths = [
+        len(tokenizer(p, truncation=True, max_length=MAX_LENGTH)["input_ids"])
+        for p in df["prompt"].tolist()
+    ]
+
+    all_features = []
     t0 = time.time()
 
-    for start in tqdm(range(0, len(all_texts), BATCH_SIZE),
-                    desc="Extracting & aggregating", unit="batch"):
+    for start in tqdm(range(0, len(all_texts), BATCH_SIZE), desc="Extracting", unit="batch"):
+        batch_texts = all_texts[start:start+BATCH_SIZE]
+        encoding = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
+        input_ids, attention_mask = encoding["input_ids"].to(device), encoding["attention_mask"].to(device)
 
-        # ── 1. Tokenise the current mini-batch ───────────────────────────────
-        batch_texts = all_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
-        input_ids      = encoding["input_ids"].to(device)
-        attention_mask = encoding["attention_mask"].to(device)
-
-        # ── 2. LLM forward pass ──────────────────────────────────────────────
-        # outputs.hidden_states: tuple of (n_layers+1) tensors,
-        # each with shape (batch, seq_len, hidden_dim).
-        # Index 0 → token embeddings; index k → transformer layer k.
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-        # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
-        # Shape: (batch, n_layers, seq_len, hidden_dim)
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        mask = attention_mask.cpu()
 
-        # ── 4. Aggregate each sample and store the compact feature vector ─────
-        # The raw `hidden` tensor is released at the end of this loop iteration.
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
-                hidden[i],   # (n_layers, seq_len, hidden_dim)
-                mask[i],     # (seq_len,)
-                use_geometric=USE_GEOMETRIC,
+                hidden[i], mask[i], 
+                use_geometric=USE_GEOMETRIC, 
+                prompt_len=prompt_lengths[start + i],
+                prompt_text=df.iloc[start + i]["prompt"],      
+                response_text=df.iloc[start + i]["response"],
+                tokenizer = tokenizer
             )
             all_features.append(feat.cpu())
 
+        del hidden, outputs, encoding, input_ids, attention_mask
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
     extract_time = time.time() - t0
-    print(f"Done in {extract_time:.1f} s  —  {len(all_features)} feature vectors extracted")
+    print(f"Extraction done in {extract_time:.1f} s")
 
-    # Stack into the (N, feature_dim) matrix used by the probe.
-    X = np.vstack([f.numpy() for f in all_features])   # shape: (N, feature_dim)
-    y = all_labels                                       # shape: (N,)
+    X = np.vstack([f.numpy() for f in all_features])
+    y = all_labels
+    print(f"Feature matrix: {X.shape}")
 
-    print(f"Feature matrix : {X.shape}  (feature_dim = {X.shape[1]})")
-    print(f"Geometric feats: {USE_GEOMETRIC}")
-
+    # Запуск CV через evaluate.py
     splits = split_data(y, df)
-
-    print(f"Splits : {len(splits)} fold(s)")
-    for i, (tr, va, te) in enumerate(splits):
-        print(f"  Fold {i + 1}: train={len(tr)}  "
-            f"val={len(va) if va is not None else 'N/A'}  test={len(te)}")
-
     fold_results = run_evaluation(splits, X, y, HallucinationProbe)
-    
     print_summary(fold_results, X.shape[1], len(X), extract_time)
     save_results(fold_results, X.shape[1], len(X), extract_time, OUTPUT_FILE)
 
-    
-
-    # ── Load test data ────────────────────────────────────────────────────────
-    df_test    = pd.read_csv(TEST_FILE)
+    # ── Test set ───────────────────────────────────────────────────────
+    df_test = pd.read_csv(TEST_FILE)
     test_texts = [f"{row['prompt']}{row['response']}" for _, row in df_test.iterrows()]
-    test_ids   = df_test.index
-    print(f"Test set loaded: {len(test_texts)} samples")
+    test_prompt_lens = [len(tokenizer(p, truncation=True, max_length=MAX_LENGTH)["input_ids"]) for p in df_test["prompt"].tolist()]
+    test_ids = df_test.index
+    print(f"Test set: {len(test_texts)} samples")
 
-    # ── Extract features for test set (same loop as Section 4) ───────────────
-    test_features: list = []
-
-    for start in tqdm(range(0, len(test_texts), BATCH_SIZE),
-                    desc="Test extraction & aggregation", unit="batch"):
-
-        batch_texts = test_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
-        input_ids      = encoding["input_ids"].to(device)
-        attention_mask = encoding["attention_mask"].to(device)
-
+    test_features = []
+    for start in tqdm(range(0, len(test_texts), BATCH_SIZE), desc="Test extraction"):
+        batch_texts = test_texts[start:start+BATCH_SIZE]
+        encoding = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH)
+        input_ids, attention_mask = encoding["input_ids"].to(device), encoding["attention_mask"].to(device)
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        mask = attention_mask.cpu()
 
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
                 hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                prompt_len=test_prompt_lens[start + i],
+                prompt_text=df_test.iloc[start + i]["prompt"],     
+                response_text=df_test.iloc[start + i]["response"], 
+                tokenizer=tokenizer
             )
             test_features.append(feat.cpu())
+        del hidden, outputs, encoding, input_ids, attention_mask
 
-    X_test = np.vstack([f.numpy() for f in test_features])  # (n_test, feature_dim)
+    X_test = np.vstack([f.numpy() for f in test_features])
 
-    # ── Fit final probe on training + validation data only ──────────────────
-    # Collect the union of all train and validation indices across every split.
-    # For a single split this excludes idx_test; for k-fold every sample appears
-    # in a training fold, so all samples are used (same as fitting on X, y).
+    # Финальное обучение на всех не-тестовых данных
     idx_non_test = np.unique(np.concatenate([
-        np.concatenate([idx_tr, idx_va]) if idx_va is not None else idx_tr
-        for idx_tr, idx_va, _ in splits
+        np.concatenate([tr, va]) for tr, va, _ in splits
     ]))
     final_probe = HallucinationProbe()
     final_probe.fit(X[idx_non_test], y[idx_non_test])
+    my_feature_names = (
+        [f"PCA_{i}" for i in range(10)] + 
+        [
+            "norm_val_13", "std_val_13", "cos_sim_24", "lexical_overlap", "ttr_resp", "response_len_norm"
+        ]
+    )
 
-    # ── Predict and save ────────────────────────────────────────────────────
+    final_probe.plot_shap_analysis(
+        X_test, 
+        feature_names=my_feature_names,
+        output_dir="./outputs"
+    )
     save_predictions(final_probe, X_test, test_ids, PREDICTIONS_FILE)
-

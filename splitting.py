@@ -1,70 +1,60 @@
 """
-splitting.py — Train / validation / test split utilities (student-implementable).
-
-``split_data`` receives the label array ``y`` and, optionally, the full
-DataFrame ``df`` (for group-aware splits).  It must return a list of
-``(idx_train, idx_val, idx_test)`` tuples of integer index arrays.
-
-Contract
---------
-* ``idx_train``, ``idx_val``, ``idx_test`` are 1-D NumPy arrays of integer
-  indices into the full dataset.
-* ``idx_val`` may be ``None`` if no separate validation fold is needed.
-* All indices must be non-overlapping; together they must cover every sample.
-* Return a **list** — one element for a single split, K elements for k-fold.
+splitting.py — Stratified split by (label, response_length_bin).
+Controls for the confounder: hallucinated responses tend to be longer.
 """
-
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+
+def _create_length_bins(response_tokens: pd.Series, n_bins: int = 4) -> pd.Series:
+    ranks = response_tokens.rank(method="first")
+    return pd.qcut(ranks, q=n_bins, labels=False)
 
 
 def split_data(
     y: np.ndarray,
     df: pd.DataFrame | None = None,
     test_size: float = 0.15,
-    val_size: float = 0.15,
+    n_splits: int = 5,
     random_state: int = 42,
-) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
-
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
-
-    Args:
-        y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
-        df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
-        random_state: Random seed for reproducible splits.
-
-    Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
-    """
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
 
     idx = np.arange(len(y))
 
+    # 1. Вычисляем длины ответов (без модификации исходного df)
+    if "response_tokens" not in df.columns:
+        from model import get_model_and_tokenizer
+        _, tokenizer = get_model_and_tokenizer()
+        response_tokens = df["response"].apply(
+            lambda x: len(tokenizer(x, truncation=False)["input_ids"])
+        )
+    else:
+        response_tokens = df["response_tokens"]
+
+    # Стратификационная переменная: комбинация класса и бина длины
+    length_bins = _create_length_bins(response_tokens, n_bins=4)
+    stratify_key = df["label"].astype(str) + "_" + length_bins.astype(str)
+
+    # Фиксированный тест-сет со стратификацией по (label, length)
     idx_train_val, idx_test = train_test_split(
         idx,
         test_size=test_size,
         random_state=random_state,
-        stratify=y,
+        stratify=stratify_key,
     )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
 
+    # Кросс-валидация по оставшимся 85%
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    splits = []
+
+    for tr, va in skf.split(idx_train_val, stratify_key.iloc[idx_train_val]):
+        splits.append((
+            idx_train_val[tr],   # train indices
+            idx_train_val[va],   # val indices (for threshold tuning)
+            idx_test             # fixed test set (same for all folds)
+        ))
+
+    return splits

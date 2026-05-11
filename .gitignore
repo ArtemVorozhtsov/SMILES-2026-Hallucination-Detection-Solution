@@ -7,8 +7,7 @@ __pycache__/
 predictions.csv
 
 # Results
-results.json
-*.json
+
 
 # HuggingFace model cache
 .cache/
@@ -24,3 +23,5 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+*.ipynb
